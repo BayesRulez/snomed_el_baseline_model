@@ -1,0 +1,4 @@
+evaluate
+ipymarkup
+jupyterlab
+seqeval

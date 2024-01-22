@@ -1,5 +1,4 @@
 evaluate
 ipymarkup
 jupyterlab
-nbautoexport
 seqeval

@@ -1,18 +1,19 @@
 """Benchmark submission for Entity Linking Challenge."""
 from pathlib import Path
-from loguru import logger
+
+import dill as pickle
 import pandas as pd
+from loguru import logger
 from more_itertools import chunked
 from peft import PeftConfig, PeftModel
-from transformers import DebertaV2ForTokenClassification, AutoTokenizer, pipeline
-import dill as pickle
+from transformers import AutoTokenizer, DebertaV2ForTokenClassification, pipeline
 
 NOTES_PATH = Path("data/test_notes.csv")
 SUBMISSION_PATH = Path("submission.csv")
 LINKER_PATH = Path("linker.pickle")
 CER_MODEL_PATH = Path("cer_model")
 
-CONTEXT_WINDOW_WIDTH = 20
+CONTEXT_WINDOW_WIDTH = 12
 MAX_SEQ_LEN = 512
 USE_LORA = False
 

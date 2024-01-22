@@ -16,6 +16,22 @@ To create a valid submission:
 1. Re-run the [notebook](entity_linker.ipynb) to generate model assets
 2. Clone the [runtime repository](https://github.com/drivendataorg/snomed-ct-entity-linking-runtime/tree/main). 
 3. Copy [`main.py`](main.py) as well as the model assets (the `cer_model/` folder and the `linker.pickle` file) generated from re-running the notebook into the `submission_src` folder in the cloned runtime repo
+    Your `submission_src` folder should look like this:
+    ```
+    submission_src
+    ├── cer_model
+    │   ├── README.md
+    │   ├── added_tokens.json
+    │   ├── config.json
+    │   ├── model.safetensors
+    │   ├── special_tokens_map.json
+    │   ├── spm.model
+    │   ├── tokenizer.json
+    │   ├── tokenizer_config.json
+    │   └── training_args.bin
+    ├── linker.pickle
+    └── main.py
+    ```
 4. Run `make pack-submission` to generate a submission zip file. You could also follow the runtime repo instructions to generate smoke test data (`make smoke-test-data`) so you can test how your submission performs locally (`make test-submission`) before submitting to the platform.
 5. Submit to the platform!
 

@@ -1,7 +1,11 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# # Introduction
+# # Benchmark Solution for the SNOMED CT Entity Linking Challenge
+# 
+# Welcome! This blog post contains code for training the benchmark entity linking model for the [SNOMED CT Entity Linking Challenge](https://www.drivendata.org/competitions/258/competition-snomed-ct/). You can find the code and instructions for reproducing this notebook in [this repository](https://github.com/BayesRulez/snomed_el_baseline_model).
+# 
+# ## Background
 # 
 # Much of the world's healthcare data is stored in free-text documents, usually clinical notes taken by doctors. This unstructured data can be challenging to analyze and extract meaningful insights from. However, by applying a standardized terminology like SNOMED CT, healthcare organizations can convert this free-text data into a structured format that can be readily analyzed by computers, in turn stimulating the development of new medicines, treatment pathways, and better patient outcomes.
 # 
@@ -9,52 +13,62 @@
 # 
 # However, clinical entity linking is hard!  Medical notes are often rife with abbreviations (some of them context-dependent) and assumed knowledge. Furthermore, the target knowledge bases can easily include hundreds of thousands of concepts, many of which occur infrequently leading to a “long tail” effect in the distribution of concepts.
 # 
-# The objective of the competition is to link spans of text in clinical notes with specific topics in the SNOMED CT clinical terminology. Participants will train models based on real-world doctors' notes which have been de-identified and annotated with SNOMED CT concepts by medically trained professionals.
+# The objective of the competition is to link spans of text in clinical notes with specific topics in the SNOMED CT clinical terminology. In this post, we build a straightforward entity linking model and prepare it for submission.  
 # 
-# In this post, we build a straightforward entity linking model and prepare it for submission.  
+# ## Benchmark architecture overview
 # 
 # Typically, an entity linker contains two components:
 # 
-# - The Clinical Entity Recognizer (CER) model is responsible for detecting candidate clinical entities from within the text.
-# - The Linker is responsible for connecting the entities to the knowledge base.  Often (as here) the liner's tasks are split into two steps:
+# - A "Clinical Entity Recognizer" (CER) that is responsible for detecting candidate clinical entities from within a text.
+# - A "Linker" that is responsible for "linking" entities detected by the CER to concepts in the knowledge base.  Often (as here) the linker's tasks are split into two steps:
 #     - In the Candidate Generation step, the Linker retrieves a handful of candidate concepts that it thinks may match to the entity.
-#     - In the Candidate Selection step, the linker selects the best candidate.
+#     - In the Candidate Selection step, the Linker selects the best candidate.
+# 
+# For this benchmark solution, we will finetune pre-trained base models for each of these components by using the provided training data for the challenge as well as SNOMED CT. We also provide an option to use [LoRA](https://huggingface.co/docs/diffusers/main/en/training/lora) (Low-Rank Adaptation of Large Language Models) to reduce resources required for training and to speed up CER model training.
+# 
+# ## Prerequisites
+# 
+# If you'd like to be able to reproduce this notebook or expand upon it for your own submissions, you'll need a few things:
+# 
+# - A GPU machine with at least 24GB of VRAM
+#     - Note: It's possible to use this notebook on machines with less VRAM, but you may need to use a different base model for the CER like `deberta-v3-base`, use `LoRA` or an equivalent low-rank LLM adaptation, train with mixed precision by setting `fp16=True` in the `TrainingArguments`, and/or decrease the batch size.
+# - A conda environment that matches the environment provided in [`environment-gpu.yml`](https://github.com/drivendataorg/snomed-ct-entity-linking-runtime/blob/main/runtime/environment-gpu.yml) or [`conda-lock-gpu.yml`](https://github.com/drivendataorg/snomed-ct-entity-linking-runtime/blob/main/runtime/conda-lock-gpu.yml) from the challenge [runtime repository](https://github.com/drivendataorg/snomed-ct-entity-linking-runtime)
+# - A clone of the [benchmark repository](https://github.com/BayesRulez/snomed_el_baseline_model) to install additional requirements (specified in `requirements.txt`) as well as leverage utilities for SNOMED CT (in `snomed_graph.py`)
+
+from itertools import combinations
+
+import dill as pickle
+import evaluate
+import numpy as np
+import pandas as pd
+import scipy.sparse as sp
+import torch
+from datasets import Dataset
+from gensim.models.keyedvectors import KeyedVectors
+from ipymarkup import show_span_line_markup
+from more_itertools import chunked
+from peft import LoraConfig, PeftConfig, PeftModel, get_peft_model
+from sentence_transformers import InputExample, SentenceTransformer, losses, models
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader
+from tqdm.notebook import tqdm
+from transformers import (
+    AutoTokenizer,
+    DataCollatorForTokenClassification,
+    DebertaV2ForTokenClassification,
+    Trainer,
+    TrainingArguments,
+    pipeline,
+)
 
 from snomed_graph import *
-import torch
-from torch.utils.data import DataLoader
-import pandas as pd
-from sklearn.model_selection import train_test_split
-from more_itertools import chunked
-from gensim.models.keyedvectors import KeyedVectors
-from tqdm.notebook import tqdm
-from itertools import combinations
-from sentence_transformers import (
-    SentenceTransformer, models, InputExample, losses
-)
-from ipymarkup import show_span_line_markup
-from peft import PeftConfig, PeftModel, LoraConfig, get_peft_model
-from datasets import Dataset
-import evaluate
-from collections import Counter
-import scipy.sparse as sp
-import numpy as np
-import dill as pickle
-from transformers import (
-    AutoTokenizer, 
-    pipeline,
-    TrainingArguments, 
-    Trainer, 
-    DataCollatorForTokenClassification,
-    DebertaV2ForTokenClassification 
-)
 
 
-random_seed = 42                                                    # For reproducibility
-max_seq_len = 512                                                   # Maximum sequence length for (BERT-based) encoders 
-cer_model_id = "microsoft/deberta-v3-large"                         # Base model for Clinical Entity Recogniser
-kb_embedding_model_id = "sentence-transformers/all-MiniLM-L6-v2"    # base model for concept encoder
-use_LoRA = False                                                    # Whether to use a LoRA to fine-tune the CER model
+random_seed = 42  # For reproducibility
+max_seq_len = 512  # Maximum sequence length for (BERT-based) encoders
+cer_model_id = "microsoft/deberta-v3-large"  # Base model for Clinical Entity Recogniser
+kb_embedding_model_id = ("sentence-transformers/all-MiniLM-L6-v2") # base model for concept encoder
+use_LoRA = False  # Whether to use a LoRA to fine-tune the CER model
 
 
 torch.manual_seed(random_seed)
@@ -63,17 +77,11 @@ assert torch.cuda.is_available()
 
 # # 1. Load the data
 
-notes_df = (
-    pd.read_csv("data/training_notes.csv")
-    .set_index("note_id")
-)
+notes_df = pd.read_csv("data/training_notes.csv").set_index("note_id")
 print(f"{notes_df.shape[0]} notes loaded.")
 
 
-annotations_df = (
-    pd.read_csv("data/training_annotations.csv")
-    .set_index("note_id")
-)
+annotations_df = pd.read_csv("data/training_annotations.csv").set_index("note_id")
 print(f"{annotations_df.shape[0]} annotations loaded.")
 print(f"{annotations_df.concept_id.nunique()} unique concepts seen.")
 print(f"{annotations_df.index.nunique()} unique notes seen.")
@@ -81,14 +89,22 @@ print(f"{annotations_df.index.nunique()} unique notes seen.")
 
 # ## 1.1 Split the data into training and test sets
 
-training_notes_df, test_notes_df = train_test_split(notes_df, test_size=32, random_state=random_seed)
+training_notes_df, test_notes_df = train_test_split(
+    notes_df, test_size=32, random_state=random_seed
+)
 training_annotations_df = annotations_df.loc[training_notes_df.index]
 test_annotations_df = annotations_df.loc[test_notes_df.index]
 
-print(f"There are {training_annotations_df.shape[0]} total annotations in the training set.")
+print(
+    f"There are {training_annotations_df.shape[0]} total annotations in the training set."
+)
 print(f"There are {test_annotations_df.shape[0]} total annotations in the test set.")
-print(f"There are {training_annotations_df.concept_id.nunique()} distinct concepts in the training set.")
-print(f"There are {test_annotations_df.concept_id.nunique()} distinct concepts in the test set.")
+print(
+    f"There are {training_annotations_df.concept_id.nunique()} distinct concepts in the training set."
+)
+print(
+    f"There are {test_annotations_df.concept_id.nunique()} distinct concepts in the test set."
+)
 print(f"There are {training_notes_df.shape[0]} notes in the training set.")
 print(f"There are {test_notes_df.shape[0]} notes in the test set.")
 
@@ -105,13 +121,9 @@ print(f"There are {test_notes_df.shape[0]} notes in the test set.")
 # - *B-clinical_entity*. This token is the beginning (first part of the first word) of a clinical entity.
 # - *I-clinical_entity*. This token is inside a clinical entity - i.e. not the first word but a subsequent word.
 
-label2id = {
-    'O': 0, 
-    'B-clinical_entity': 1, 
-    'I-clinical_entity': 2
-}
+label2id = {"O": 0, "B-clinical_entity": 1, "I-clinical_entity": 2}
 
-id2label = {v: k for k,v in label2id.items()}
+id2label = {v: k for k, v in label2id.items()}
 
 
 # ## 2.2 Load a tokenizer
@@ -119,8 +131,7 @@ id2label = {v: k for k,v in label2id.items()}
 # We'll use the tokenizer for our chosen NER model.
 
 cer_tokenizer = AutoTokenizer.from_pretrained(
-    cer_model_id, 
-    model_max_length=max_seq_len
+    cer_model_id, model_max_length=max_seq_len
 )
 
 
@@ -156,16 +167,14 @@ def get_annotation_boundaries(note_id, annotations_df):
 
 
 def generate_ner_dataset(notes_df, annotations_df):
-
     for row in notes_df.itertuples():
-        
         tokenized = cer_tokenizer(
-            row.text, 
-            return_offsets_mapping=False,   # Avoid misalignments due to destructive tokenization
-            return_token_type_ids=False,    # We're going to construct these below
-            return_attention_mask=False,    # We'll construct this by hand
-            add_special_tokens=False,       # We'll add these by hand
-            truncation=False,               # We'll chunk the notes ourselves
+            row.text,
+            return_offsets_mapping=False,  # Avoid misalignments due to destructive tokenization
+            return_token_type_ids=False,  # We're going to construct these below
+            return_attention_mask=False,  # We'll construct this by hand
+            add_special_tokens=False,  # We'll add these by hand
+            truncation=False,  # We'll chunk the notes ourselves
         )
 
         # Prime the annotation generator and fetch the token <-> word_id map
@@ -174,28 +183,28 @@ def generate_ner_dataset(notes_df, annotations_df):
         word_ids = tokenized.word_ids()
 
         # The offsets_mapping returned by the tokenizer will be misaligned vs the original text.
-        # This is due to the fact that the tokenization scheme is destructive, for example it 
+        # This is due to the fact that the tokenization scheme is destructive, for example it
         # drops spaces which cannot be recovered when decoding the inputs.
-        # In the following code snippet we create an offset mapping which is aligned with the 
+        # In the following code snippet we create an offset mapping which is aligned with the
         # original text; hence we can accurately locate the annotations and match them to the
         # tokens.
         global_offset = 0
         global_offset_mapping = []
-        
+
         for input_id in tokenized["input_ids"]:
             token = cer_tokenizer.decode(input_id)
             pos = row.text[global_offset:].find(token)
             start = global_offset + pos
             end = global_offset + pos + len(token)
             global_offset = end
-            global_offset_mapping.append((start, end))        
+            global_offset_mapping.append((start, end))
 
         # Note the max_seq_len - 2.
         # This is because we will have to add [CLS] and [SEP] tokens once we're done.
         it = zip(
-            chunked(tokenized["input_ids"], max_seq_len-2),
-            chunked(global_offset_mapping, max_seq_len-2),
-            chunked(word_ids, max_seq_len-2)
+            chunked(tokenized["input_ids"], max_seq_len - 2),
+            chunked(global_offset_mapping, max_seq_len - 2),
+            chunked(word_ids, max_seq_len - 2),
         )
 
         # Since we are chunking the discharge notes, we need to maintain the start and
@@ -203,7 +212,7 @@ def generate_ner_dataset(notes_df, annotations_df):
         # chunks > 1
         chunk_start_idx = 0
         chunk_end_idx = 0
-        
+
         for chunk_id, chunk in enumerate(it):
             input_id_chunk, offset_mapping_chunk, word_id_chunk = chunk
             token_type_chunk = list()
@@ -212,21 +221,20 @@ def generate_ner_dataset(notes_df, annotations_df):
             concept_word_number = 0
             chunk_start_idx = chunk_end_idx
             chunk_end_idx = offset_mapping_chunk[-1][1]
-            
+
             for offsets, word_id in zip(offset_mapping_chunk, word_id_chunk):
                 token_start, token_end = offsets
-                
+
                 # Check whether we need to fetch the next annotation
                 if token_start >= ann_end:
-                    ann_start, ann_end, concept_id = next(annotation_boundaries)  
+                    ann_start, ann_end, concept_id = next(annotation_boundaries)
                     concept_word_number = 0
-            
+
                 # Check whether the token's position overlaps with the next annotation
                 if token_start < ann_end and token_end > ann_start:
-
                     if prev_word_id != word_id:
                         concept_word_number += 1
-                    
+
                     # If so, annotate based on the word number in the concept
                     if concept_word_number == 1:
                         token_type_chunk.append(label2id["B-clinical_entity"])
@@ -235,21 +243,27 @@ def generate_ner_dataset(notes_df, annotations_df):
 
                     # Add the SCTID (we'll use this later to train the Linker)
                     concept_id_chunk.append(concept_id)
-        
+
                 # Not part of an annotation
                 else:
                     token_type_chunk.append(label2id["O"])
                     concept_id_chunk.append(None)
-            
+
                 prev_word_id = word_id
 
             # Manually adding the [CLS] and [SEP] tokens.
             token_type_chunk = [-100] + token_type_chunk + [-100]
-            input_id_chunk = [cer_tokenizer.cls_token_id] + input_id_chunk + [cer_tokenizer.sep_token_id]
+            input_id_chunk = (
+                [cer_tokenizer.cls_token_id]
+                + input_id_chunk
+                + [cer_tokenizer.sep_token_id]
+            )
             attention_mask_chunk = [1] * len(input_id_chunk)
-            offset_mapping_chunk = [(None, None)] + offset_mapping_chunk + [(None, None)]
+            offset_mapping_chunk = (
+                [(None, None)] + offset_mapping_chunk + [(None, None)]
+            )
             concept_id_chunk = [None] + concept_id_chunk + [None]
-            
+
             yield {
                 # These are the fields we need
                 "note_id": row.Index,
@@ -260,14 +274,16 @@ def generate_ner_dataset(notes_df, annotations_df):
                 "chunk_id": chunk_id,
                 "chunk_span": (chunk_start_idx, chunk_end_idx),
                 "offset_mapping": offset_mapping_chunk,
-                "text": row.text[chunk_start_idx : chunk_end_idx],                
+                "text": row.text[chunk_start_idx:chunk_end_idx],
                 "concept_ids": concept_id_chunk,
             }
 
 
 # We can ignore the "Token indices sequence length is longer than the specified maximum sequence length"
 # warning because we are chunking by hand.
-train = pd.DataFrame(list(generate_ner_dataset(training_notes_df, training_annotations_df)))
+train = pd.DataFrame(
+    list(generate_ner_dataset(training_notes_df, training_annotations_df))
+)
 train = Dataset.from_pandas(train)
 train
 
@@ -287,8 +303,8 @@ data_collator = DataCollatorForTokenClassification(tokenizer=cer_tokenizer)
 
 seqeval = evaluate.load("seqeval")
 
-def compute_metrics(p):
 
+def compute_metrics(p):
     predictions, labels = p
     predictions = np.argmax(predictions, axis=2)
 
@@ -301,9 +317,9 @@ def compute_metrics(p):
         [id2label[l] for (p, l) in zip(prediction, label) if l != -100]
         for prediction, label in zip(predictions, labels)
     ]
-    
+
     results = seqeval.compute(predictions=true_predictions, references=true_labels)
-    
+
     return {
         "precision": results["overall_precision"],
         "recall": results["overall_recall"],
@@ -317,11 +333,8 @@ def compute_metrics(p):
 # The `deberta-v3-large` model (model card: https://huggingface.co/microsoft/deberta-v3-large) has 304M parameters.  To speed up the fine-tuning can use a LoRA, which will greatly reduce the number of trainable parameters.
 
 cer_model = DebertaV2ForTokenClassification.from_pretrained(
-    cer_model_id, 
-    num_labels=3,
-    id2label=id2label,
-    label2id=label2id
-)   
+    cer_model_id, num_labels=3, id2label=id2label, label2id=label2id
+)
 
 if use_LoRA:
     lora_config = LoraConfig(
@@ -331,9 +344,9 @@ if use_LoRA:
         bias="none",
         task_type="TOKEN_CLS",
     )
-    
+
     cer_model = get_peft_model(cer_model, lora_config)
-    
+
     cer_model.print_trainable_parameters()
 
 
@@ -348,7 +361,8 @@ training_args = TrainingArguments(
     save_strategy="epoch",
     logging_steps=10,
     load_best_model_at_end=True,
-    seed=random_seed
+    fp16=False,
+    seed=random_seed,
 )
 
 trainer = Trainer(
@@ -371,40 +385,40 @@ cer_tokenizer.save_pretrained("cer_model")
 # ## 2.6 CER Inference
 
 # We can ignore the warning message.  This is simply due to the fact that
-# DebertaV2ForTokenClassification loads the DebertaV2 model first, then 
-# initializes a random header model before restoring the states of the 
-# TokenClassifer.  So we *do* have our fine-tuned model available. 
+# DebertaV2ForTokenClassification loads the DebertaV2 model first, then
+# initializes a random header model before restoring the states of the
+# TokenClassifer.  So we *do* have our fine-tuned model available.
 
 if use_LoRA:
     config = PeftConfig.from_pretrained("cer_model")
 
     cer_model = DebertaV2ForTokenClassification.from_pretrained(
         pretrained_model_name_or_path=config.base_model_name_or_path,
-        num_labels=3, 
-        id2label=id2label, 
-        label2id=label2id
-    )  
+        num_labels=3,
+        id2label=id2label,
+        label2id=label2id,
+    )
     cer_model = PeftModel.from_pretrained(cer_model, "cer_model")
 else:
     cer_model = DebertaV2ForTokenClassification.from_pretrained(
         pretrained_model_name_or_path="cer_model",
-        num_labels=3, 
-        id2label=id2label, 
-        label2id=label2id
-    )  
+        num_labels=3,
+        id2label=id2label,
+        label2id=label2id,
+    )
 
 
-# If using the adaptor, ignore the warning: 
+# If using the adaptor, ignore the warning:
 # "The model 'PeftModelForTokenClassification' is not supported for token-classification."
 # The PEFT model is wrapped just fine and will work within the pipeline.
-# N.B. moving model to CPU makes inference slower, but enables us to feed the pipeline 
+# N.B. moving model to CPU makes inference slower, but enables us to feed the pipeline
 # directly with strings.
 cer_pipeline = pipeline(
-    task="token-classification", 
-    model=cer_model, 
-    tokenizer=cer_tokenizer, 
+    task="token-classification",
+    model=cer_model,
+    tokenizer=cer_tokenizer,
     aggregation_strategy="first",
-    device="cpu"
+    device="cpu",
 )
 
 
@@ -417,12 +431,11 @@ text = test_notes_df.loc[note_id].text
 
 # +1 to offset the [CLS] token which will have been added by the tokenizer
 predicted_annotations = [
-    (span["start"]+1, span["end"], "PRED") for span in cer_pipeline(text)
+    (span["start"] + 1, span["end"], "PRED") for span in cer_pipeline(text)
 ]
 
 gt_annotations = [
-    (row.start, row.end, "GT")
-    for row in test_annotations_df.loc[note_id].itertuples()
+    (row.start, row.end, "GT") for row in test_annotations_df.loc[note_id].itertuples()
 ]
 
 show_span_line_markup(text, predicted_annotations + gt_annotations)
@@ -438,9 +451,9 @@ show_span_line_markup(text, predicted_annotations + gt_annotations)
 
 # ## 3.1 Load the knowledge base
 
-# To load from a SNOMED RF2 folder, use:
+# To load from a SNOMED RF2 folder (like the edition provided for the challenge) use:
 # 
-# ```SG = SnomedGraph.from_rf2("SnomedCT_InternationalRF2_PRODUCTION_20230531T120000Z")```
+# ```SG = SnomedGraph.from_rf2("SnomedCT_InternationalRF2_PRODUCTION_20230531T120000Z_Challenge_Edition")```
 # 
 # Here, we will load a previously constructed concept graph and filter to the concepts that were in scope of the annotation exercise.
 
@@ -448,14 +461,17 @@ SG = SnomedGraph.from_serialized("../snomed_graph/full_concept_graph.gml")
 
 
 # If we want to load all of the concepts that were in scope of the annotation exercise, it's this:
-concepts_in_scope = SG.get_descendants(71388002) | SG.get_descendants(123037004) | SG.get_descendants(404684003)
+concepts_in_scope = (
+    SG.get_descendants(71388002)
+    | SG.get_descendants(123037004)
+    | SG.get_descendants(404684003)
+)
 print(f"{len(concepts_in_scope)} concepts have been selected.")
 
 
 # If we want to simply use concepts for which we have a training example, it's this:
 concepts_in_scope = [
-    SG.get_concept_details(a)
-    for a in annotations_df.concept_id.unique()
+    SG.get_concept_details(a) for a in annotations_df.concept_id.unique()
 ]
 
 print(f"{len(concepts_in_scope)} concepts have been selected.")
@@ -480,8 +496,8 @@ kb_sft_dataloader = DataLoader(kb_sft_examples, shuffle=True, batch_size=32)
 kb_sft_loss = losses.ContrastiveLoss(kb_model)
 
 kb_model.fit(
-    train_objectives=[(kb_sft_dataloader, kb_sft_loss)], 
-    epochs=2, 
+    train_objectives=[(kb_sft_dataloader, kb_sft_loss)],
+    epochs=2,
     warmup_steps=100,
     checkpoint_path="~/temp/ke_encoder",
 )
@@ -502,10 +518,9 @@ kb_model.save("kb_model")
 # 
 # We perform a simple grid search over context window sizes.
 # 
-# As a further enhancement, we not only train the linker using entities seen in the training dataset but also with all of the synonyms for the in-scope SNOMED concepts (here there is no "context" for each of the entities, so we simply use the entity as it's own context.)  You can run an ablation experiment by not passing the Linker any SNOMED concepts.  The performance will drop!
+# As a further enhancement, we not only train the linker using entities seen in the training dataset but also with all of the synonyms for the in-scope SNOMED concepts (here there is no "context" for each of the entities, so we simply use the entity as its own context.)  You can run an ablation experiment by not passing the Linker any SNOMED concepts—the performance will drop!
 
-class Linker():
-    
+class Linker:
     def __init__(self, encoder, context_window_width=0):
         self.encoder = encoder
         self.entity_index = KeyedVectors(self.encoder[1].word_embedding_dimension)
@@ -514,12 +529,12 @@ class Linker():
         self.context_window_width = context_window_width
 
     def add_context(self, row):
-        window_start = max(0, row.start-self.context_window_width)
-        window_end = min(row.end+self.context_window_width, len(row.text))
-        return row.text[window_start : window_end]
+        window_start = max(0, row.start - self.context_window_width)
+        window_end = min(row.end + self.context_window_width, len(row.text))
+        return row.text[window_start:window_end]
 
     def add_entity(self, row):
-        return row.text[row.start : row.end]       
+        return row.text[row.start : row.end]
 
     def fit(self, df=None, snomed_concepts=None):
         # Create a map from the entities to the concepts and contexts in which they appear
@@ -541,8 +556,8 @@ class Linker():
                     contexts = map_.get(c.sctid, list())
                     contexts.append(syn)
                     map_[c.sctid] = contexts
-                    self.history[syn] = map_            
-            
+                    self.history[syn] = map_
+
         # Create indexes to help disambiguate entities by their contexts
         for entity, map_ in tqdm(self.history.items()):
             keys = [
@@ -550,11 +565,7 @@ class Linker():
                 for concept_id, contexts in map_.items()
                 for occurance, context in enumerate(contexts)
             ]
-            contexts = [
-                context 
-                for contexts in map_.values() 
-                for context in contexts
-            ]
+            contexts = [context for contexts in map_.values() for context in contexts]
             vectors = self.encoder.encode(contexts)
             index = KeyedVectors(self.encoder[1].word_embedding_dimension)
             index.add_vectors(keys, vectors)
@@ -567,18 +578,18 @@ class Linker():
 
     def link(self, row):
         entity = self.add_entity(row)
-        context = self.add_context(row)        
+        context = self.add_context(row)
         vec = self.encoder.encode(entity)
-        nearest_entity = self.entity_index.most_similar(vec, topn=1)[0][0]     
+        nearest_entity = self.entity_index.most_similar(vec, topn=1)[0][0]
         index = self.context_index.get(nearest_entity, None)
-        
+
         if index:
             vec = self.encoder.encode(context)
             key, score = index.most_similar(vec, topn=1)[0]
             sctid, _ = key
             return sctid
         else:
-            return None 
+            return None
 
 
 linker_training_df = training_notes_df.join(training_annotations_df)
@@ -593,7 +604,7 @@ def evaluate_linker(linker, df):
         sctid = linker.link(row)
         if row["concept_id"] == sctid:
             n_correct += 1
-    
+
     return n_correct / n_examples
 
 
@@ -623,61 +634,62 @@ with open("linker.pickle", "rb") as f:
 # ## 4.1 Prediction pipeline
 
 def predict(df):
-
     # One note at a time...
     for row in tqdm(df.itertuples(), total=df.shape[0]):
-        
         # Tokenize the entire discharge note
         tokenized = cer_tokenizer(
-            row.text, 
-            return_offsets_mapping=False,    
-            add_special_tokens=False,   
-            truncation=False,       
+            row.text,
+            return_offsets_mapping=False,
+            add_special_tokens=False,
+            truncation=False,
         )
 
         global_offset = 0
         global_offset_mapping = []
 
-        # Adjust the token offsets so that they match the original document 
+        # Adjust the token offsets so that they match the original document
         for input_id in tokenized["input_ids"]:
             token = cer_tokenizer.decode(input_id)
             pos = row.text[global_offset:].find(token)
             start = global_offset + pos
             end = global_offset + pos + len(token)
             global_offset = end
-            global_offset_mapping.append((start, end))     
+            global_offset_mapping.append((start, end))
 
         chunk_start_idx = 0
-        chunk_end_idx = 0            
-            
+        chunk_end_idx = 0
+
         # Process the document in chunks of 512 tokens chunk at a time
-        for offset_chunk in chunked(global_offset_mapping, max_seq_len-2):
+        for offset_chunk in chunked(global_offset_mapping, max_seq_len - 2):
             chunk_start_idx = chunk_end_idx
             chunk_end_idx = offset_chunk[-1][1]
             chunk_text = row.text[chunk_start_idx:chunk_end_idx]
 
             # Iterate through the detected entities and link them
             for entity in cer_pipeline(chunk_text):
-                example = pd.Series({
-                    # +1 to account for the [CLS] token
-                    "start": entity["start"] + chunk_start_idx + 1, 
-                    "end": entity["end"] + chunk_start_idx,            
-                    "text": row.text
-                })
+                example = pd.Series(
+                    {
+                        # +1 to account for the [CLS] token
+                        "start": entity["start"] + chunk_start_idx + 1,
+                        "end": entity["end"] + chunk_start_idx,
+                        "text": row.text,
+                    }
+                )
                 sctid = linker.link(example)
 
                 # Only yield matches where the Linker returned something
                 if sctid:
                     yield {
-                        'note_id': row.Index,
-                        'start': example["start"],  
-                        'end': example["end"],
-                        'concept_id': sctid,
+                        "note_id": row.Index,
+                        "start": example["start"],
+                        "end": example["end"],
+                        "concept_id": sctid,
                         # The following are useful for debugging and analysis
-                        'FSN': SG.get_concept_details(sctid).fsn,
-                        'entity': row.text[example["start"]:example["end"]],
-                        'tokenizer_word': entity["word"]
+                        "FSN": SG.get_concept_details(sctid).fsn,
+                        "entity": row.text[example["start"] : example["end"]],
+                        "tokenizer_word": entity["word"],
                     }
+
 
 preds_df = pd.DataFrame(list(predict(test_notes_df)))
 
@@ -690,12 +702,12 @@ note_id = "10807423-DS-19"
 text = test_notes_df.loc[note_id].text
 
 predicted_annotations = [
-    (row.start, row.end, f'P_{row.concept_id}')
+    (row.start, row.end, f"P_{row.concept_id}")
     for row in preds_df.set_index("note_id").loc[note_id].itertuples()
 ]
 
 gt_annotations = [
-    (row.start, row.end, f'GT_{row.concept_id}')
+    (row.start, row.end, f"GT_{row.concept_id}")
     for row in test_annotations_df.loc[note_id].itertuples()
 ]
 
@@ -706,16 +718,22 @@ show_span_line_markup(text, predicted_annotations + gt_annotations)
 # 
 # We apply a token-level scorer function, which is what the competition will use to evaluate solutions.  We run this over our reserved test set to get a sense for out-of-sample performance.
 
-def iou_per_class(user_annotations: pd.DataFrame, target_annotations: pd.DataFrame) -> List[float]:
+def iou_per_class(
+    user_annotations: pd.DataFrame, target_annotations: pd.DataFrame
+) -> List[float]:
     """
     Calculate the IoU metric for each class in a set of annotations.
     """
     # Get mapping from note_id to index in array
-    docs = np.unique(np.concatenate([user_annotations.note_id, target_annotations.note_id]))
+    docs = np.unique(
+        np.concatenate([user_annotations.note_id, target_annotations.note_id])
+    )
     doc_index_mapping = dict(zip(docs, range(len(docs))))
 
     # Identify union of categories in GT and PRED
-    cats = np.unique(np.concatenate([user_annotations.concept_id, target_annotations.concept_id]))
+    cats = np.unique(
+        np.concatenate([user_annotations.concept_id, target_annotations.concept_id])
+    )
 
     # Find max character index in GT or PRED
     max_end = np.max(np.concatenate([user_annotations.end, target_annotations.end]))
@@ -752,11 +770,7 @@ print(f"macro-averaged character IoU metric: {np.mean(ious):0.4f}")
 
 # # 5. Preparing for Submission
 # 
-# Here we wrap the model up into a compliant submission format. (Note that, before submitting, we'd want to re-fit both the CER model (using the optimal number of training epochs) and the Linker on _all_ of the data.)
-# 
-# Before we do so, it's a good idea to re-train the entity linker on all of the available notes, just to squeeze out every last drop of performance.
-# 
-# The contents of `solution.py` are as follows:
+# Here we wrap the model up into a compliant submission format. (Note that, before submitting, we'd want to re-fit both the CER model (using the optimal number of training epochs) and the Linker on _all_ of the data.) Here, we'll just re-train briefly on the held-out notes and annotations.
 
 # ## 5.1 Finalise the CER model
 # 
@@ -788,35 +802,32 @@ with open("linker.pickle", "wb") as f:
     pickle.dump(linker, f)
 
 
+# The contents of `main.py` for a submission that complies with the [runtime specification](https://github.com/drivendataorg/snomed-ct-entity-linking-runtime/tree/main) are as follows:
+
 """Benchmark submission for Entity Linking Challenge."""
 from pathlib import Path
-from loguru import logger
+
+import dill as pickle
 import pandas as pd
+from loguru import logger
 from more_itertools import chunked
 from peft import PeftConfig, PeftModel
-from transformers import (
-    DebertaV2ForTokenClassification, AutoTokenizer, pipeline
-)
-import dill as pickle
+from transformers import AutoTokenizer, DebertaV2ForTokenClassification, pipeline
 
 NOTES_PATH = Path("data/test_notes.csv")
 SUBMISSION_PATH = Path("submission.csv")
 LINKER_PATH = Path("linker.pickle")
 CER_MODEL_PATH = Path("cer_model")
 
-CONTEXT_WINDOW_WIDTH = 20
+CONTEXT_WINDOW_WIDTH = 12
 MAX_SEQ_LEN = 512
 USE_LORA = False
 
+
 def load_cer_pipeline():
+    label2id = {"O": 0, "B-clinical_entity": 1, "I-clinical_entity": 2}
 
-    label2id = {
-        'O': 0, 
-        'B-clinical_entity': 1, 
-        'I-clinical_entity': 2
-    }    
-
-    id2label = {v: k for k,v in label2id.items()}
+    id2label = {v: k for k, v in label2id.items()}
 
     cer_tokenizer = AutoTokenizer.from_pretrained(
         CER_MODEL_PATH, model_max_length=MAX_SEQ_LEN
@@ -827,30 +838,30 @@ def load_cer_pipeline():
 
         cer_model = DebertaV2ForTokenClassification.from_pretrained(
             pretrained_model_name_or_path=config.base_model_name_or_path,
-            num_labels=3, 
-            id2label=id2label, 
-            label2id=label2id
-        )  
+            num_labels=3,
+            id2label=id2label,
+            label2id=label2id,
+        )
         cer_model = PeftModel.from_pretrained(cer_model, CER_MODEL_PATH)
     else:
         cer_model = DebertaV2ForTokenClassification.from_pretrained(
             pretrained_model_name_or_path=CER_MODEL_PATH,
-            num_labels=3, 
-            id2label=id2label, 
-            label2id=label2id
-        )  
+            num_labels=3,
+            id2label=id2label,
+            label2id=label2id,
+        )
 
     cer_pipeline = pipeline(
-        task="token-classification", 
-        model=cer_model, 
-        tokenizer=cer_tokenizer, 
+        task="token-classification",
+        model=cer_model,
+        tokenizer=cer_tokenizer,
         aggregation_strategy="first",
-        device="cpu"
-    )  
+        device="cpu",
+    )
     return cer_pipeline
 
 
-def main():    
+def main():
     # columns are note_id, text
     logger.info("Reading in notes data.")
     notes = pd.read_csv(NOTES_PATH)
@@ -861,40 +872,39 @@ def main():
     logger.info("Loading CER pipeline.")
     cer_pipeline = load_cer_pipeline()
     cer_tokenizer = cer_pipeline.tokenizer
-    
+
     logger.info("Loading Linker")
     with open(LINKER_PATH, "rb") as f:
         linker = pickle.load(f)
-    
+
     # Process one note at a time...
     logger.info("Processing notes.")
     for row in notes.itertuples():
-
         # Tokenize the entire discharge note
         tokenized = cer_tokenizer(
-            row.text, 
-            return_offsets_mapping=False,    
-            add_special_tokens=False,       
-            truncation=False,       
+            row.text,
+            return_offsets_mapping=False,
+            add_special_tokens=False,
+            truncation=False,
         )
 
         global_offset = 0
         global_offset_mapping = []
 
-        # Adjust the token offsets so that they match the original document 
+        # Adjust the token offsets so that they match the original document
         for input_id in tokenized["input_ids"]:
             token = cer_tokenizer.decode(input_id)
             pos = row.text[global_offset:].find(token)
             start = global_offset + pos
             end = global_offset + pos + len(token)
             global_offset = end
-            global_offset_mapping.append((start, end))     
+            global_offset_mapping.append((start, end))
 
         chunk_start_idx = 0
-        chunk_end_idx = 0            
-            
+        chunk_end_idx = 0
+
         # Process the document in chunks of 512 tokens chunk at a time
-        for offset_chunk in chunked(global_offset_mapping, MAX_SEQ_LEN-2):
+        for offset_chunk in chunked(global_offset_mapping, MAX_SEQ_LEN - 2):
             chunk_start_idx = chunk_end_idx
             chunk_end_idx = offset_chunk[-1][1]
             chunk_text = row.text[chunk_start_idx:chunk_end_idx]
@@ -902,25 +912,30 @@ def main():
             # ...one matched clinical entity at a time
             # Iterate through the detected entities and link them
             for entity in cer_pipeline(chunk_text):
-                example = pd.Series({
-                    # +1 to account for the [CLS] token
-                    "start": entity["start"] + chunk_start_idx + 1, 
-                    "end": entity["end"] + chunk_start_idx,            
-                    "text": row.text
-                })
+                example = pd.Series(
+                    {
+                        # +1 to account for the [CLS] token
+                        "start": entity["start"] + chunk_start_idx + 1,
+                        "end": entity["end"] + chunk_start_idx,
+                        "text": row.text,
+                    }
+                )
                 sctid = linker.link(example)
                 if sctid:
-                    spans.append({
-                        'note_id': row.Index,
-                        'start': example["start"],
-                        'end': example["end"],
-                        'concept_id': sctid
-                    })
-    
+                    spans.append(
+                        {
+                            "note_id": row.Index,
+                            "start": example["start"],
+                            "end": example["end"],
+                            "concept_id": sctid,
+                        }
+                    )
+
     logger.info(f"Generated {len(spans)} annotated spans.")
     spans_df = pd.DataFrame(spans)
     spans_df.to_csv(SUBMISSION_PATH, index=False)
     logger.info("Finished.")
+
 
 if __name__ == "__main__":
     main()
